@@ -1,19 +1,30 @@
+mod models;
+mod indexer;
+mod controllers;
+mod db;
+use std::env;
+use db::transaction::{save_transaction, save_accounts};
+use sqlx::{pool::PoolOptions, Pool, Postgres};
+use axum::{ routing::get, Router };
 use dotenvy::dotenv;
+use indexer::transaction::get_transactions_from_block;
 use solana_client::pubsub_client::PubsubClient;
 use solana_client::rpc_config::{RpcBlockSubscribeConfig, RpcBlockSubscribeFilter};
 use solana_sdk::commitment_config::CommitmentConfig;
-use solana_sdk::transaction;
 use solana_transaction_status::{
-    EncodedTransaction, TransactionDetails, UiMessage, UiTransactionEncoding,
-    UiTransactionStatusMeta,
+     TransactionDetails, UiTransactionEncoding
 };
-mod config;
-use tokio::time::{sleep, Duration};
+use tokio::{net::TcpListener, time::{sleep, Duration}};
 
-#[tokio::main]
-async fn main() {
-    dotenv().expect("Failed to load .env file");
+#[derive(Clone)]
+pub struct AppState {
+    pub db_pool: Pool<Postgres>
+}
 
+
+async fn listen_to_blocks(
+    shared_state: AppState
+) {
     let filter = RpcBlockSubscribeFilter::All;
     let config = RpcBlockSubscribeConfig {
         commitment: Some(CommitmentConfig::confirmed()),
@@ -30,77 +41,51 @@ async fn main() {
 
     match subscription_result {
         Ok((_tx_confirmed_block, rx_confirmed_block)) => {
-            // loop {
+            loop {
             match rx_confirmed_block.recv() {
                 Ok(response) => {
                     let block = response.value.block.unwrap();
-                    println!(
-                        "block: {:?}, time: {:?}",
-                        block.block_height, block.block_time
-                    );
-                    let txns = block.transactions.unwrap_or_else(|| vec![]);
-                    for txn in txns {
-                        println!("txn: {:?}", txn.transaction);
-
-
-                        let tx_meta = txn.meta.unwrap();
-                        println!("txn meta: {:?}", tx_meta);
-
-                        // store: status, from, to, amount, block_height, block_time, signature, fee
-                        match txn.transaction {
-                            EncodedTransaction::Json(data) => {
-                                let signatures = data.signatures;
-                                let message = data.message;
-
-                                let signature = signatures[0].to_string();
-
-                                let pre_balances = tx_meta.pre_balances;
-                                let post_balances = tx_meta.post_balances;
-
-                                // let amount = pre_balances[0] - post_balances[0] - tx_meta.fee;
-
-                                println!(
-                                    "prebalance {:?}, postbalance: {:?}, fee: {:?}",
-                                    pre_balances, post_balances, tx_meta.fee
-                                );
-
-                                match message {
-                                    UiMessage::Parsed(msg) => {
-                                        // let from_address = &msg.account_keys[0].pubkey;
-                                        // let to_address = &msg.account_keys[1].pubkey;
-                                        // println!(
-                                        //     "from: {:?}, to: {:?}, amount: {:?}",
-                                        //     from_address, to_address, amount
-                                        // );
+                    match get_transactions_from_block(block) {
+                        Ok(transactions) => {
+                            let mut tx = shared_state.db_pool.begin().await.unwrap();
+                            let mut success = true;
+                            
+                            for transaction in transactions {
+                                match save_transaction(transaction.clone(), &mut tx).await {
+                                    Ok(saved_tx) => {
+                                        if let Err(e) = save_accounts(transaction.accounts, saved_tx.id.unwrap(), &mut tx).await {
+                                            eprintln!("Error saving accounts: {:?}", e);
+                                            success = false;
+                                            break;
+                                        }
+                                        println!("Transaction and accounts saved successfully");
                                     }
-                                    UiMessage::Raw(msg) => {
-                                        // let from_address = &msg.account_keys[0];
-                                        // let to_address = &msg.account_keys[1];
-                                        // println!(
-                                        //     "from: {:?}, to: {:?}, amount: {:?}",
-                                        //     from_address, to_address, amount
-                                        // );
+                                    Err(e) => {
+                                        eprintln!("Error saving transaction: {:?}", e);
+                                        success = false;
+                                        break;
                                     }
                                 }
                             }
-                            EncodedTransaction::Binary(_, _) => {
-                                println!("  Binary transaction (skipping)");
-                            }
-                            EncodedTransaction::LegacyBinary(_) => {
-                                println!("  Legacy binary transaction (skipping)");
-                            }
-                            EncodedTransaction::Accounts(_) => {
-                                println!("  Accounts (skipping)");
+
+                            if success {
+                                if let Err(e) = tx.commit().await {
+                                    eprintln!("Error committing transaction: {:?}", e);
+                                }
+                            } else {
+                                if let Err(e) = tx.rollback().await {
+                                    eprintln!("Error rolling back transaction: {:?}", e);
+                                }
                             }
                         }
+                        Err(e) => eprintln!("Error processing block: {}", e),
                     }
                 }
                 Err(e) => {
                     eprintln!("block subscription error: {:?}", e)
-                    // break;
                 }
             }
-            // }
+            }
         }
         Err(e) => {
             eprintln!("block subscription error: {:?}", e)
@@ -108,4 +93,37 @@ async fn main() {
     }
 
     sleep(Duration::from_secs(1)).await;
+}
+
+#[tokio::main]
+async fn main() {
+    dotenv().expect("Failed to load .env file");
+    let db_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+
+    let db_pool: Pool<Postgres> = PoolOptions::new()
+        .max_connections(10).connect(&db_url)
+        .await.expect("Failed to connect to database");
+
+    let shared_state = AppState {
+        db_pool,
+    };
+
+    sqlx::migrate!("src/db/migrations").run(&shared_state.db_pool).await.expect("Failed to run migrations");
+
+    let app = Router::new()
+        .nest("/transactions", transation_routes())
+        .with_state(shared_state.clone());  // Clone here
+
+    let listener = TcpListener::bind("0.0.0.0:3000").await.unwrap();
+
+    // Spawn the block listener in a separate task
+    tokio::spawn(listen_to_blocks(shared_state));
+
+    axum::serve(listener, app).await.expect("Failed to serve");
+}
+
+
+fn transation_routes() -> Router<AppState> {
+    Router::new()
+        .route("/", get(controllers::transaction::get_transactions))
 }

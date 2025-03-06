@@ -9,3 +9,14 @@ tokio = { version = "1.28", features = ["full"] }
 solana-client = "1.18.12"
 solana-sdk = "1.18.12"
 solana-transaction-status = "1.18.12"
+serde = { version = "1.0.218", features = ["derive"] }
+axum = "0.8.1"
+sqlx = { version = "0.8.3", features = ["derive" , "postgres", "uuid", "chrono" ,"runtime-tokio", "tls-native-tls"] }
+
+[patch.crates-io.aes-gcm-siv]
+git = "https://github.com/RustCrypto/AEADs"
+rev = "6105d7a5591aefa646a95d12b5e8d3f55a9214ef"
+
+[patch.crates-io.curve25519-dalek]
+git = "https://github.com/solana-labs/curve25519-dalek.git"
+rev = "c14774464c4d38de553c6ef2f48a10982c1b4801"
